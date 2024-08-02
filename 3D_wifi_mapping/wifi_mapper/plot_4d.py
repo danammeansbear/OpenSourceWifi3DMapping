@@ -1,52 +1,41 @@
-import plotly.graph_objects as go
-import numpy as np
-import matplotlib.pyplot as plt
-import csv
-import matplotlib.tri as tri
-import math
-from os import listdir
-from os.path import isfile, join
+import pika
+import json
 
+# Connect to RabbitMQ
+connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
+channel = connection.channel()
 
-x = []
-y = []
-z = []
-c = []
-s = []
-o = []
+# Declare the queue
+channel.queue_declare(queue='device_logs')
 
-path = 'stack_data/'
-filename = 'csv_file_1637175707.csv'
-fileindex = 0
+# Define a callback function to process the messages
+def callback(ch, method, properties, body):
+    # Decode the message body from bytes to string
+    body_str = body.decode('utf-8')
 
-onlyfiles = [f for f in listdir(path) if isfile(join(path, f))]
-onlyfiles = sorted(onlyfiles)
+    # Parse the JSON string to a dictionary
+    log = json.loads(body_str)
 
-for filename in onlyfiles:
-    if filename != '.DS_Store':
-        with open(path + filename, 'r') as csvfile:
-            plots = csv.reader(csvfile, delimiter=',')
-            for row in plots:
-                if float(row[2]) < -54.0:
-                    y.append(float(row[0]))
-                    x.append(float(row[1]))
-                    z.append(float(fileindex))
-                    c.append(float(row[2]))
-                    s.append((-float(row[2]) - 57))
-                    # o.append(-float(row[2]) / 200)
-        fileindex += 1
+    # Extract the log values
+    user_info = log.get('User')
+    os = log.get('OS')
+    device_model = log.get('Device Model')
+    geolocation_data = log.get('Geolocation Data')
+    accelerometer_data = log.get('Accelerometer Data')
+    available_devices = log.get('Available Devices')
+    wifi_signal_strength = log.get('Wi-Fi Signal Strength')
 
-print(min(s))
-fig = go.Figure(data=[go.Scatter3d(x=x,
-                                   y=y,
-                                   z=z,
-                                   marker=dict(
-                                       size=s,
-                                       color=c,  # set color to an array/list of desired values
-                                       colorscale='phase',  # choose a colorscale
-                                       opacity=0.4
-                                   ),
-                                   mode='markers')]
+    # Print the log values
+    print(f"User Info: {user_info}")
+    print(f"OS: {os}")
+    print(f"Device Model: {device_model}")
+    print(f"Geolocation Data: {geolocation_data}")
+    print(f"Accelerometer Data: {accelerometer_data}")
+    print(f"Available Devices: {available_devices}")
+    print(f"Wi-Fi Signal Strength: {wifi_signal_strength}")
 
-                )
-fig.show()
+# Set the callback function for the 'device_logs' queue
+channel.basic_consume(queue='device_logs', on_message_callback=callback, auto_ack=True)
+
+# Start consuming messages
+channel.start_consuming()
