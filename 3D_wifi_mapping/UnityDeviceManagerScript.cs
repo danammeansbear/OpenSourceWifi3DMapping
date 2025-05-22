@@ -11,52 +11,140 @@ using log4net.Config;
 using System.IO;
 using RabbitMQ.Client;
 using System.Text;
+using System;
 
 public class DeviceInfoLogger : MonoBehaviour
 {
     public Text logText;
+    [SerializeField] private float logInterval = 5f; // Interval for logging network data and Wi-Fi signal strength
+    [SerializeField] private float accelerometerLogInterval = 1f; // Interval for logging accelerometer data
+    [SerializeField] private string rabbitMQHostName = "localhost";
+    [SerializeField] private string rabbitMQQueueName = "device_logs";
+
     private List<string> logs = new List<string>();
-    private float logInterval = 5f; // Interval for logging network data and Wi-Fi signal strength
     private static readonly ILog log = LogManager.GetLogger(typeof(DeviceInfoLogger));
 
     private IConnection rabbitMQConnection;
     private IModel rabbitMQChannel;
+    private bool rabbitMQConnected = false;
+    private Coroutine accelerometerCoroutine;
+    private Coroutine deviceInfoCoroutine;
 
     void Start()
     {
         // Configure log4net
-        var logRepository = LogManager.GetRepository(System.Reflection.Assembly.GetExecutingAssembly());
-        XmlConfigurator.Configure(logRepository, new FileInfo("Assets/log4net.config"));
+        try
+        {
+            var logRepository = LogManager.GetRepository(System.Reflection.Assembly.GetExecutingAssembly());
+            XmlConfigurator.Configure(logRepository, new FileInfo("Assets/log4net.config"));
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"Failed to configure log4net: {ex.Message}");
+        }
 
         // Configure RabbitMQ
-        var factory = new ConnectionFactory() { HostName = "localhost" }; // Change to your RabbitMQ server hostname
-        rabbitMQConnection = factory.CreateConnection();
-        rabbitMQChannel = rabbitMQConnection.CreateModel();
-        rabbitMQChannel.QueueDeclare(queue: "device_logs", durable: false, exclusive: false, autoDelete: false, arguments: null);
+        ConnectToRabbitMQ();
 
-        StartCoroutine(LogDeviceInfo());
+        // Start logging coroutines
+        deviceInfoCoroutine = StartCoroutine(LogDeviceInfo());
+        accelerometerCoroutine = StartCoroutine(LogAccelerometerDataPeriodically());
+    }
+
+    void ConnectToRabbitMQ()
+    {
+        try
+        {
+            var factory = new ConnectionFactory() { HostName = rabbitMQHostName };
+            rabbitMQConnection = factory.CreateConnection();
+            rabbitMQChannel = rabbitMQConnection.CreateModel();
+            rabbitMQChannel.QueueDeclare(queue: rabbitMQQueueName, durable: false, exclusive: false, autoDelete: false, arguments: null);
+            rabbitMQConnected = true;
+            AddLog("Successfully connected to RabbitMQ");
+        }
+        catch (Exception ex)
+        {
+            rabbitMQConnected = false;
+            string errorMessage = $"Failed to connect to RabbitMQ: {ex.Message}";
+            AddLog(errorMessage);
+            log.Error(errorMessage);
+            Debug.LogError(errorMessage);
+        }
     }
 
     void OnDestroy()
     {
-        rabbitMQChannel.Close();
-        rabbitMQConnection.Close();
+        if (deviceInfoCoroutine != null)
+            StopCoroutine(deviceInfoCoroutine);
+        
+        if (accelerometerCoroutine != null)
+            StopCoroutine(accelerometerCoroutine);
+
+        if (rabbitMQConnected)
+        {
+            try
+            {
+                rabbitMQChannel?.Close();
+                rabbitMQConnection?.Close();
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"Error closing RabbitMQ connection: {ex.Message}");
+            }
+        }
+    }
+
+    void OnApplicationPause(bool pauseStatus)
+    {
+        if (pauseStatus)
+        {
+            // App is paused
+            if (deviceInfoCoroutine != null)
+                StopCoroutine(deviceInfoCoroutine);
+            
+            if (accelerometerCoroutine != null)
+                StopCoroutine(accelerometerCoroutine);
+        }
+        else
+        {
+            // App is resumed
+            deviceInfoCoroutine = StartCoroutine(LogDeviceInfo());
+            accelerometerCoroutine = StartCoroutine(LogAccelerometerDataPeriodically());
+        }
     }
 
     void Update()
     {
-        LogAccelerometerData();
         UpdateLogText();
+    }
+
+    IEnumerator LogAccelerometerDataPeriodically()
+    {
+        while (true)
+        {
+            LogAccelerometerData();
+            yield return new WaitForSeconds(accelerometerLogInterval);
+        }
     }
 
     IEnumerator LogDeviceInfo()
     {
         while (true)
         {
-            LogUserInfo();
-            yield return StartCoroutine(LogGeolocationData());
-            LogAvailableDevices();
-            LogWifiSignalStrength();
+            try
+            {
+                LogUserInfo();
+                yield return StartCoroutine(LogGeolocationData());
+                StartCoroutine(LogAvailableDevicesAsync());
+                LogWifiSignalStrength();
+            }
+            catch (Exception ex)
+            {
+                string errorMessage = $"Error in LogDeviceInfo: {ex.Message}";
+                AddLog(errorMessage);
+                log.Error(errorMessage);
+                Debug.LogError(errorMessage);
+            }
             yield return new WaitForSeconds(logInterval);
         }
     }
@@ -118,61 +206,116 @@ public class DeviceInfoLogger : MonoBehaviour
 
     void LogAccelerometerData()
     {
-        Vector3 acceleration = Input.acceleration;
-        string accelerometerData = $"Accelerometer: x={acceleration.x}, y={acceleration.y}, z={acceleration.z}";
-        AddLog(accelerometerData);
-        log.Info(accelerometerData);
-        SendMessageToRabbitMQ(accelerometerData);
+        try
+        {
+            Vector3 acceleration = Input.acceleration;
+            string accelerometerData = $"Accelerometer: x={acceleration.x:F2}, y={acceleration.y:F2}, z={acceleration.z:F2}";
+            AddLog(accelerometerData);
+            log.Info(accelerometerData);
+            SendMessageToRabbitMQ(accelerometerData);
+        }
+        catch (Exception ex)
+        {
+            string errorMessage = $"Error logging accelerometer data: {ex.Message}";
+            AddLog(errorMessage);
+            log.Error(errorMessage);
+            Debug.LogError(errorMessage);
+        }
     }
 
-    void LogAvailableDevices()
+    IEnumerator LogAvailableDevicesAsync()
     {
-        foreach (NetworkInterface netInterface in NetworkInterface.GetAllNetworkInterfaces())
+        try
         {
-            if (netInterface.OperationalStatus == OperationalStatus.Up)
+            foreach (NetworkInterface netInterface in NetworkInterface.GetAllNetworkInterfaces())
             {
-                foreach (UnicastIPAddressInformation ip in netInterface.GetIPProperties().UnicastAddresses)
+                if (netInterface.OperationalStatus == OperationalStatus.Up)
                 {
-                    if (ip.Address.AddressFamily == AddressFamily.InterNetwork)
+                    foreach (UnicastIPAddressInformation ip in netInterface.GetIPProperties().UnicastAddresses)
                     {
-                        Ping ping = new Ping();
-                        PingReply reply = ping.Send(ip.Address);
-                        if (reply.Status == IPStatus.Success)
+                        if (ip.Address.AddressFamily == AddressFamily.InterNetwork)
                         {
-                            string deviceInfo = $"Device: {ip.Address}, Ping: {reply.RoundtripTime}ms";
-                            AddLog(deviceInfo);
-                            log.Info(deviceInfo);
-                            SendMessageToRabbitMQ(deviceInfo);
+                            yield return StartCoroutine(PingAddressAsync(ip.Address));
                         }
                     }
                 }
             }
         }
+        catch (Exception ex)
+        {
+            string errorMessage = $"Error logging network devices: {ex.Message}";
+            AddLog(errorMessage);
+            log.Error(errorMessage);
+            Debug.LogError(errorMessage);
+        }
+    }
+
+    IEnumerator PingAddressAsync(IPAddress address)
+    {
+        try
+        {
+            Ping ping = new Ping(address.ToString());
+            
+            // Wait for ping to complete (with timeout)
+            float startTime = Time.time;
+            while (!ping.isDone && Time.time - startTime < 2f)
+            {
+                yield return null;
+            }
+            
+            if (ping.isDone && ping.time >= 0)
+            {
+                string deviceInfo = $"Device: {address}, Ping: {ping.time}ms";
+                AddLog(deviceInfo);
+                log.Info(deviceInfo);
+                SendMessageToRabbitMQ(deviceInfo);
+            }
+        }
+        catch (Exception ex)
+        {
+            string errorMessage = $"Error pinging address {address}: {ex.Message}";
+            AddLog(errorMessage);
+            log.Error(errorMessage);
+            Debug.LogError(errorMessage);
+        }
     }
 
     void LogWifiSignalStrength()
     {
+        try
+        {
 #if UNITY_ANDROID
-        AndroidJavaClass wifiManagerClass = new AndroidJavaClass("android.net.wifi.WifiManager");
-        AndroidJavaObject wifiManager = wifiManagerClass.CallStatic<AndroidJavaObject>("getSystemService", "wifi");
-        AndroidJavaObject wifiInfo = wifiManager.Call<AndroidJavaObject>("getConnectionInfo");
-        int signalStrength = wifiInfo.Call<int>("getRssi");
-        string wifiSignal = $"Wi-Fi Signal Strength: {signalStrength} dBm";
-        AddLog(wifiSignal);
-        log.Info(wifiSignal);
-        SendMessageToRabbitMQ(wifiSignal);
+            using (AndroidJavaObject activity = new AndroidJavaClass("com.unity3d.player.UnityPlayer").GetStatic<AndroidJavaObject>("currentActivity"))
+            using (AndroidJavaObject context = activity.Call<AndroidJavaObject>("getApplicationContext"))
+            using (AndroidJavaObject wifiManager = context.Call<AndroidJavaObject>("getSystemService", "wifi"))
+            {
+                AndroidJavaObject wifiInfo = wifiManager.Call<AndroidJavaObject>("getConnectionInfo");
+                int signalStrength = wifiInfo.Call<int>("getRssi");
+                string wifiSignal = $"Wi-Fi Signal Strength: {signalStrength} dBm";
+                AddLog(wifiSignal);
+                log.Info(wifiSignal);
+                SendMessageToRabbitMQ(wifiSignal);
+            }
 #elif UNITY_IOS
-        // Assuming you have a native iOS plugin to get Wi-Fi signal strength
-        string wifiSignal = GetIOSWiFiSignalStrength();
-        AddLog(wifiSignal);
-        log.Info(wifiSignal);
-        SendMessageToRabbitMQ(wifiSignal);
+            // Assuming you have a native iOS plugin to get Wi-Fi signal strength
+            string wifiSignal = GetIOSWiFiSignalStrength();
+            AddLog(wifiSignal);
+            log.Info(wifiSignal);
+            SendMessageToRabbitMQ(wifiSignal);
 #else
-        string message = "Wi-Fi Signal Strength not available on this platform.";
-        AddLog(message);
-        log.Warn(message);
-        SendMessageToRabbitMQ(message);
+            string message = "Wi-Fi Signal Strength not available on this platform.";
+            AddLog(message);
+            log.Warn(message);
+            SendMessageToRabbitMQ(message);
 #endif
+        }
+        catch (Exception ex)
+        {
+            string errorMessage = $"Error getting WiFi signal strength: {ex.Message}";
+            AddLog(errorMessage);
+            log.Error(errorMessage);
+            Debug.LogError(errorMessage);
+        }
     }
 
     // This method would call an iOS plugin to get Wi-Fi signal strength
@@ -185,7 +328,7 @@ public class DeviceInfoLogger : MonoBehaviour
 
     void AddLog(string message)
     {
-        logs.Add($"{System.DateTime.Now}: {message}");
+        logs.Add($"{DateTime.Now.ToString("HH:mm:ss")}: {message}");
         if (logs.Count > 20)
         {
             logs.RemoveAt(0);
@@ -194,12 +337,34 @@ public class DeviceInfoLogger : MonoBehaviour
 
     void UpdateLogText()
     {
-        logText.text = string.Join("\n", logs.ToArray());
+        if (logText != null)
+        {
+            logText.text = string.Join("\n", logs.ToArray());
+        }
     }
 
     void SendMessageToRabbitMQ(string message)
     {
-        var body = Encoding.UTF8.GetBytes(message);
-        rabbitMQChannel.BasicPublish(exchange: "", routingKey: "device_logs", basicProperties: null, body: body);
+        if (!rabbitMQConnected)
+        {
+            // Try to reconnect
+            ConnectToRabbitMQ();
+            if (!rabbitMQConnected)
+                return;
+        }
+
+        try
+        {
+            var body = Encoding.UTF8.GetBytes(message);
+            rabbitMQChannel.BasicPublish(exchange: "", routingKey: rabbitMQQueueName, basicProperties: null, body: body);
+        }
+        catch (Exception ex)
+        {
+            rabbitMQConnected = false;
+            string errorMessage = $"Error sending message to RabbitMQ: {ex.Message}";
+            AddLog(errorMessage);
+            log.Error(errorMessage);
+            Debug.LogError(errorMessage);
+        }
     }
 }
